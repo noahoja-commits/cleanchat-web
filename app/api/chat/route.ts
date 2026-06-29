@@ -9,7 +9,7 @@ const HF_MODEL =
 export async function POST(req: NextRequest) {
   if (!HF_API_KEY) {
     return NextResponse.json(
-      { error: "HF_API_KEY not configured. Set it in Vercel environment variables." },
+      { error: "HF_API_KEY not configured." },
       { status: 500 }
     );
   }
@@ -20,36 +20,52 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing messages array" }, { status: 400 });
     }
 
-    const url = `https://api-inference.huggingface.co/models/${HF_MODEL}/v1/chat/completions`;
-    console.log("Calling HF API:", url);
+    // Build a prompt string from the messages (works with all HF models)
+    const prompt = messages
+      .map((m: any) => {
+        if (m.role === "system") return `<|system|>\n${m.content}\n`;
+        if (m.role === "user") return `<|user|>\n${m.content}\n`;
+        if (m.role === "assistant") return `<|assistant|>\n${m.content}\n`;
+        return "";
+      })
+      .join("") + "<|assistant|>\n";
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${HF_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: HF_MODEL,
-        messages,
-        max_tokens: 2000,
-        stream: false,
-      }),
-    });
-
-    console.log("HF response status:", response.status);
+    const response = await fetch(
+      `https://api-inference.huggingface.co/models/${HF_MODEL}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${HF_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: {
+            max_new_tokens: 2000,
+            return_full_text: false,
+          },
+        }),
+      }
+    );
 
     if (!response.ok) {
       const text = await response.text();
-      console.log("HF error body:", text.slice(0, 300));
+      const isModelLoading = response.status === 503;
       return NextResponse.json(
-        { error: `HF API error ${response.status}: ${text.slice(0, 200)}` },
+        {
+          error: isModelLoading
+            ? "Model is loading (cold start). Try again in 20-30 seconds."
+            : `HF API error ${response.status}: ${text.slice(0, 200)}`,
+        },
         { status: 500 }
       );
     }
 
     const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    // HF text-generation returns [{generated_text: "..."}]
+    const content = Array.isArray(data)
+      ? data[0]?.generated_text || ""
+      : data.generated_text || "";
 
     if (!content) {
       return NextResponse.json({
@@ -60,9 +76,8 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ reply: content });
   } catch (err: any) {
-    console.error("Fetch error:", err.message, err.cause);
     return NextResponse.json(
-      { error: `Request failed: ${err.message}${err.cause ? " — " + err.cause : ""}` },
+      { error: `Request failed: ${err.message}` },
       { status: 500 }
     );
   }
