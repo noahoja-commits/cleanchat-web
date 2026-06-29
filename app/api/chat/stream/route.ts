@@ -126,10 +126,12 @@ export async function POST(req: NextRequest) {
 
   const model = process.env.HF_MODEL || "meta-llama/Llama-3.1-8B-Instruct";
 
-  // Try Inference API with streaming
+  // Stream via the HF Router (OpenAI-compatible). The legacy
+  // api-inference.huggingface.co host is unreachable from Vercel, so we use the
+  // same router endpoint the non-streaming /api/chat route relies on.
   try {
     const response = await fetch(
-      `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}/v1/chat completions`,
+      "https://router.huggingface.co/featherless-ai/v1/chat/completions",
       {
         method: "POST",
         headers: {
