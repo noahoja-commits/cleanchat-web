@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { HfInference } from "@huggingface/inference";
 
 export const maxDuration = 60;
 
@@ -8,6 +7,8 @@ export async function POST(req: NextRequest) {
   if (!hfKey) {
     return NextResponse.json({ error: "HF_API_KEY not configured." }, { status: 500 });
   }
+
+  const model = process.env.HF_MODEL || "Orenguteng/Llama-3-8B-Lexi-Uncensored";
 
   let messages: any[];
   try {
@@ -20,46 +21,51 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const model = process.env.HF_MODEL || "Orenguteng/Llama-3-8B-Lexi-Uncensored";
+  // Use router.huggingface.co (api-inference subdomain blocked from Vercel)
+  const url = `https://router.huggingface.co/featherless-ai/v1/chat/completions`;
 
-  // Try router endpoint first (api-inference subdomain is blocked on some networks)
-  const endpoints = [
-    "https://router.huggingface.co",
-    "https://api-inference.huggingface.co",
-  ];
-
-  let lastError = "";
-
-  for (const endpoint of endpoints) {
-    try {
-      const hf = new HfInference(hfKey, { endpointUrl: endpoint });
-      const response = await hf.chatCompletion({
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${hfKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
         model,
         messages,
         max_tokens: 2000,
-      });
+      }),
+    });
 
-      const content = response.choices?.[0]?.message?.content;
-      if (content) {
-        return NextResponse.json({ reply: content });
-      }
-      return NextResponse.json({ reply: "(Model returned empty response.)" });
-    } catch (err: any) {
-      lastError = err.message || "Unknown";
-      // If the error is not a network failure, don't try other endpoints
-      if (!lastError.includes("fetch failed") && !lastError.includes("ENOTFOUND")) {
-        break;
-      }
+    const text = await res.text();
+
+    if (!res.ok) {
+      return NextResponse.json(
+        { error: `HF API ${res.status}: ${text.slice(0, 300)}` },
+        { status: 502 }
+      );
     }
-  }
 
-  // Friendly error messages
-  if (lastError.includes("loading") || lastError.includes("503")) {
+    let content = "";
+    try {
+      const data = JSON.parse(text);
+      content = data.choices?.[0]?.message?.content || "";
+    } catch {
+      content = text;
+    }
+
+    if (!content) {
+      return NextResponse.json({
+        reply: "(The model returned an empty response. It may still be loading — try again.)",
+      });
+    }
+
+    return NextResponse.json({ reply: content });
+  } catch (err: any) {
     return NextResponse.json(
-      { error: "Model is loading. Try again in ~30 seconds." },
-      { status: 503 }
+      { error: `Network error: ${err.message}` },
+      { status: 502 }
     );
   }
-
-  return NextResponse.json({ error: lastError }, { status: 502 });
 }
