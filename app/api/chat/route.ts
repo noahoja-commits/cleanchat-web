@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
 
   for (const endpoint of endpoints) {
     try {
-      const hf = new HfInference(hfKey, { endpoint });
+      const hf = new HfInference(hfKey, { endpointUrl: endpoint });
       const response = await hf.chatCompletion({
         model,
         messages,
