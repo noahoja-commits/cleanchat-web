@@ -37,15 +37,16 @@ npm run dev
 ```
 
 ## Features
-- Dark theme (matches the desktop CleanChat look)
-- Code blocks with line numbers
-- Markdown rendering (bold, inline code, code blocks)
-- Streaming-like typing indicator
-- Responsive — works on mobile
-- No JavaScript sent to the client except the UI — API key stays server-side
-- Uncensored by default (change the model to anything on HuggingFace)
+- Real-time **streaming** responses (with a Stop button — Esc)
+- **Multiple conversations** — create, switch, rename (double-click), and delete; persisted in `localStorage`
+- **Export** any chat to Markdown (`.md`) or JSON (`.json`)
+- **Message actions** — copy any reply, copy individual code blocks, or regenerate the last response
+- Markdown rendering — headings, bold/italic, lists, task lists, blockquotes, links, and code blocks with line numbers
+- Dark theme, responsive layout, keyboard shortcuts (Ctrl/⌘+Enter send · Esc stop · Ctrl/⌘+Shift+N new · `/` focus)
+- Server-side API key — the HuggingFace token never reaches the browser
+- Per-IP rate limiting and request validation on the API routes
 
 ## Customize
-- **Model:** Set `HF_MODEL` env var (default: Orenguteng/Llama-3-8B-Lexi-Uncensored)
+- **Model:** Set `HF_MODEL` env var (default: `meta-llama/Llama-3.1-8B-Instruct`)
 - **System prompt:** Edit the `SYSTEM_PROMPT` constant in `app/page.tsx`
 - **Theme:** Edit the `styles` object in `app/page.tsx`
