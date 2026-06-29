@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-export const maxDuration = 60; // Vercel Pro: 60s timeout for cold HF model starts
+export const maxDuration = 60;
 
 const HF_API_KEY = process.env.HF_API_KEY || "";
 const HF_MODEL =
@@ -16,42 +16,35 @@ export async function POST(req: NextRequest) {
 
   try {
     const { messages } = await req.json();
-
     if (!messages || !Array.isArray(messages)) {
       return NextResponse.json({ error: "Missing messages array" }, { status: 400 });
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 55_000); // 55s fetch timeout
+    const url = `https://api-inference.huggingface.co/models/${HF_MODEL}/v1/chat/completions`;
+    console.log("Calling HF API:", url);
 
-    const response = await fetch(
-      `https://api-inference.huggingface.co/models/${HF_MODEL}/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${HF_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: HF_MODEL,
-          messages,
-          max_tokens: 2000,
-          stream: false,
-        }),
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(timeout);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: HF_MODEL,
+        messages,
+        max_tokens: 2000,
+        stream: false,
+      }),
+    });
+
+    console.log("HF response status:", response.status);
 
     if (!response.ok) {
       const text = await response.text();
-      const hint =
-        response.status === 503
-          ? " (Model is loading — try again in 20-30 seconds)"
-          : "";
+      console.log("HF error body:", text.slice(0, 300));
       return NextResponse.json(
-        { error: `HF API error ${response.status}: ${text.slice(0, 200)}${hint}` },
-        { status: response.status }
+        { error: `HF API error ${response.status}: ${text.slice(0, 200)}` },
+        { status: 500 }
       );
     }
 
@@ -67,10 +60,10 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ reply: content });
   } catch (err: any) {
-    const msg =
-      err.name === "AbortError"
-        ? "Request timed out — the model may be cold-starting. Try again."
-        : `Request failed: ${err.message}`;
-    return NextResponse.json({ error: msg }, { status: 500 });
+    console.error("Fetch error:", err.message, err.cause);
+    return NextResponse.json(
+      { error: `Request failed: ${err.message}${err.cause ? " — " + err.cause : ""}` },
+      { status: 500 }
+    );
   }
 }
