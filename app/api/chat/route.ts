@@ -191,7 +191,7 @@ export async function POST(req: NextRequest) {
       }));
       
       const res = await fetch(
-        "https://router.huggingface.co/chat-completions/v1/chat/completions",
+        "https://router.huggingface.co/featherless-ai/v1/chat/completions",
         {
           method: "POST",
           headers: {
