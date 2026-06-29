@@ -17,6 +17,7 @@ interface Conversation {
   messages: Message[];
   createdAt: number;
   updatedAt: number;
+  customTitle?: boolean;
 }
 
 const SYSTEM_PROMPT: Omit<Message, "id" | "timestamp"> = {
@@ -51,6 +52,12 @@ function formatContent(text: string): string {
         .join("\n");
       return `<div class="code-block"><div class="code-head">${(lang || "code").toUpperCase()}<button class="copy-code-btn" data-code="${encodeURIComponent(code.trim())}">Copy</button></div><pre><code>${numbered}</code></pre></div>`;
     })
+    // Headings (longest marker first)
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    // Horizontal rule
+    .replace(/^(?:---|\*\*\*|___)$/gm, "<hr>")
     // Blockquotes
     .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
     // Task lists
@@ -66,6 +73,12 @@ function formatContent(text: string): string {
     .replace(/\*(.+?)\*/g, "<i>$1</i>")
     // Inline code
     .replace(/`([^`]+)`/g, '<code class="inline">$1</code>')
+    // Links — only allow safe protocols to avoid javascript:/data: injection
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, href) => {
+      const safe = /^(https?:\/\/|mailto:)/i.test(href);
+      if (!safe) return label;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
     // Line breaks
     .replace(/\n/g, "<br>");
 }
@@ -108,18 +121,51 @@ function exportToMarkdown(messages: Message[]): string {
   return md;
 }
 
+function exportToJson(messages: Message[], title?: string): string {
+  const payload = {
+    app: "CleanChat",
+    title: title || "Chat Export",
+    exportedAt: new Date().toISOString(),
+    messages: messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp,
+        ...(m.responseTime ? { responseTime: m.responseTime } : {}),
+      })),
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+function downloadFile(content: string, filename: string, mime: string): void {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // Memoized components for performance
-const MessageBubble = memo(function MessageBubble({ 
-  message, 
+const MessageBubble = memo(function MessageBubble({
+  message,
   onCopy,
   copiedIdx,
-}: { 
-  message: Message; 
+  isLastAssistant,
+  onRegenerate,
+  loading,
+}: {
+  message: Message;
   onCopy: (text: string, idx: string) => void;
   copiedIdx: string | null;
+  isLastAssistant: boolean;
+  onRegenerate: () => void;
+  loading: boolean;
 }) {
   const { id, content, role, isError, timestamp, responseTime } = message;
-  
+
   const handleCopy = useCallback(() => {
     onCopy(content, id);
   }, [content, id, onCopy]);
@@ -145,6 +191,7 @@ const MessageBubble = memo(function MessageBubble({
           <span style={styles.timestamp}>{formatTimestamp(timestamp)}</span>
         </div>
         <div
+          className="bubble-content"
           dangerouslySetInnerHTML={{
             __html: formatContent(content),
           }}
@@ -167,8 +214,13 @@ const MessageBubble = memo(function MessageBubble({
             )}
             <span style={styles.wordCount}>{countWords(content)} words</span>
             {!isError && (
-              <button onClick={handleCopy} style={styles.copyBtn}>
+              <button onClick={handleCopy} style={styles.copyBtn} aria-label="Copy message">
                 {copiedIdx === id ? "Copied!" : "Copy"}
+              </button>
+            )}
+            {isLastAssistant && !loading && (
+              <button onClick={onRegenerate} style={styles.copyBtn} aria-label="Regenerate response">
+                ↻ Regenerate
               </button>
             )}
           </div>
@@ -198,12 +250,22 @@ const ConversationItem = memo(function ConversationItem({
   isActive,
   onSelect,
   onDelete,
+  onRename,
 }: {
   conversation: Conversation;
   isActive: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onRename: (title: string) => void;
 }) {
+  const handleRename = useCallback(() => {
+    const next = window.prompt("Rename conversation", conversation.title);
+    if (next !== null) {
+      const trimmed = next.trim();
+      if (trimmed) onRename(trimmed.slice(0, 80));
+    }
+  }, [conversation.title, onRename]);
+
   return (
     <div
       style={{
@@ -212,10 +274,18 @@ const ConversationItem = memo(function ConversationItem({
         borderLeft: isActive ? "3px solid #ff4444" : "3px solid transparent",
       }}
     >
-      <button onClick={onSelect} style={styles.convTitle}>
+      <button
+        onClick={onSelect}
+        onDoubleClick={handleRename}
+        style={styles.convTitle}
+        title={`${conversation.title} (double-click to rename)`}
+      >
         {conversation.title}
       </button>
-      <button onClick={onDelete} style={styles.convDelete} title="Delete">
+      <button onClick={handleRename} style={styles.convRename} title="Rename" aria-label="Rename conversation">
+        ✎
+      </button>
+      <button onClick={onDelete} style={styles.convDelete} title="Delete" aria-label="Delete conversation">
         ×
       </button>
     </div>
@@ -240,36 +310,57 @@ export default function Home() {
   const textareaId = useId();
   const streamingContentRef = useRef<string>("");
   const responseStartRef = useRef<number>(0);
+  // Mirror of the latest messages so stable callbacks can read them without
+  // being re-created on every streamed token (keeps MessageBubble memoized).
+  const messagesRef = useRef<Message[]>(messages);
+  messagesRef.current = messages;
 
-  // Load conversations from localStorage
+  // Restore conversations from localStorage on mount, and guarantee there is
+  // always an active conversation so the very first chat is persisted too.
   useEffect(() => {
     try {
       const saved = localStorage.getItem(CONVERSATIONS_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setConversations(parsed);
+      const parsed = saved ? JSON.parse(saved) : null;
+
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setConversations(parsed);
+        const savedId = localStorage.getItem(CURRENT_CONV_KEY);
+        const active = parsed.find((c: Conversation) => c.id === savedId) || parsed[0];
+        setCurrentConvId(active.id);
+        if (Array.isArray(active.messages) && active.messages.length > 0) {
+          setMessages(active.messages);
         }
-      }
-      const currentId = localStorage.getItem(CURRENT_CONV_KEY);
-      if (currentId) {
-        setCurrentConvId(currentId);
+        return;
       }
     } catch {
-      // Ignore errors
+      // Ignore corrupt storage and fall through to a fresh conversation.
     }
+
+    // No saved conversations — start one now so it shows in the sidebar
+    // and is persisted as soon as the user sends a message.
+    const id = generateId();
+    const seed: Conversation = {
+      id,
+      title: "New Chat",
+      messages: [{ ...SYSTEM_PROMPT, id: generateId(), timestamp: Date.now() }],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setConversations([seed]);
+    setCurrentConvId(id);
+    setMessages(seed.messages);
   }, []);
 
-  // Load current conversation
+  // Persist which conversation is active.
   useEffect(() => {
     if (currentConvId) {
-      const conv = conversations.find(c => c.id === currentConvId);
-      if (conv) {
-        setMessages(conv.messages);
+      try {
+        localStorage.setItem(CURRENT_CONV_KEY, currentConvId);
+      } catch {
+        // Ignore storage errors
       }
-      localStorage.setItem(CURRENT_CONV_KEY, currentConvId);
     }
-  }, [currentConvId, conversations]);
+  }, [currentConvId]);
 
   // Save conversations to localStorage
   useEffect(() => {
@@ -294,6 +385,19 @@ export default function Home() {
   }, []);
 
   const createNewConversation = useCallback(() => {
+    // If the active conversation is already an untouched "New Chat", reuse it
+    // rather than stacking duplicate empty entries in the sidebar.
+    const active = conversations.find((c) => c.id === currentConvId);
+    if (active && active.messages.filter((m) => m.role !== "system").length === 0) {
+      setMessages(active.messages);
+      setInput("");
+      setLoading(false);
+      setAutoScroll(true);
+      setShowSidebar(false);
+      inputRef.current?.focus();
+      return;
+    }
+
     const id = generateId();
     const newConv: Conversation = {
       id,
@@ -310,7 +414,7 @@ export default function Home() {
     setAutoScroll(true);
     inputRef.current?.focus();
     setShowSidebar(false);
-  }, []);
+  }, [conversations, currentConvId]);
 
   const selectConversation = useCallback((id: string) => {
     setCurrentConvId(id);
@@ -337,17 +441,24 @@ export default function Home() {
   const saveCurrentConversation = useCallback(() => {
     if (currentConvId) {
       const userMessages = messages.filter(m => m.role === "user");
-      const title = userMessages.length > 0 
+      const autoTitle = userMessages.length > 0
         ? userMessages[userMessages.length - 1].content.slice(0, 50) + (userMessages[userMessages.length - 1].content.length > 50 ? "..." : "")
         : "New Chat";
-      
-      setConversations(prev => prev.map(c => 
-        c.id === currentConvId 
-          ? { ...c, messages, title, updatedAt: Date.now() }
+
+      setConversations(prev => prev.map(c =>
+        c.id === currentConvId
+          // Don't clobber a title the user set by hand.
+          ? { ...c, messages, title: c.customTitle ? c.title : autoTitle, updatedAt: Date.now() }
           : c
       ));
     }
   }, [currentConvId, messages]);
+
+  const renameConversation = useCallback((id: string, title: string) => {
+    setConversations(prev => prev.map(c =>
+      c.id === id ? { ...c, title, customTitle: true, updatedAt: Date.now() } : c
+    ));
+  }, []);
 
   // Save on message changes
   useEffect(() => {
@@ -368,31 +479,22 @@ export default function Home() {
     setTimeout(() => setCopiedIdx(null), 2000);
   }, []);
 
-  const exportChat = useCallback(() => {
-    const md = exportToMarkdown(messages);
-    const blob = new Blob([md], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `chat-export-${Date.now()}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const currentTitle = useMemo(
+    () => conversations.find((c) => c.id === currentConvId)?.title,
+    [conversations, currentConvId]
+  );
+
+  const exportChatMarkdown = useCallback(() => {
+    downloadFile(exportToMarkdown(messages), `chat-export-${Date.now()}.md`, "text/markdown");
   }, [messages]);
 
-  const regenerate = useCallback(async () => {
-    // Remove last assistant message if exists
-    const lastAssistantIdx = messages.findLastIndex(m => m.role === "assistant");
-    if (lastAssistantIdx === -1) return;
-    
-    const msgsWithoutLast = messages.slice(0, lastAssistantIdx);
-    const userMsgs = msgsWithoutLast.filter(m => m.role === "user");
-    if (userMsgs.length === 0) return;
-    
-    const lastUserMsg = userMsgs[userMsgs.length - 1];
-    const msgsToSend = msgsWithoutLast.slice(0, msgsWithoutLast.indexOf(lastUserMsg) + 1);
-    
-    setMessages(msgsToSend);
-    setInput("");
+  const exportChatJson = useCallback(() => {
+    downloadFile(exportToJson(messages, currentTitle), `chat-export-${Date.now()}.json`, "application/json");
+  }, [messages, currentTitle]);
+
+  // Shared streaming pipeline used by both send and regenerate. The caller is
+  // responsible for having already placed `msgsToSend` into the message list.
+  const streamResponse = useCallback(async (msgsToSend: Message[]) => {
     setLoading(true);
     setIsStreaming(true);
     setAutoScroll(true);
@@ -401,6 +503,9 @@ export default function Home() {
     abortRef.current = controller;
     streamingContentRef.current = "";
     responseStartRef.current = Date.now();
+
+    const assistantMsgId = generateId();
+    let fullContent = "";
 
     try {
       const res = await fetch("/api/chat/stream", {
@@ -416,23 +521,24 @@ export default function Home() {
       }
 
       const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      
-      if (!reader) throw new Error("No reader available");
+      if (!reader) throw new Error("No response stream available");
 
-      const assistantMsgId = generateId();
-      let fullContent = "";
+      const decoder = new TextDecoder();
+      // Buffer across reads so an SSE line split across chunks is never dropped.
+      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const text = decoder.decode(value, { stream: true });
-        const lines = text.split("\n");
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6);
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data: ")) continue;
+          const data = trimmed.slice(6);
           if (data === "[DONE]") continue;
 
           try {
@@ -440,8 +546,7 @@ export default function Home() {
             if (parsed.content) {
               fullContent += parsed.content;
               streamingContentRef.current = fullContent;
-              
-              // Update message in real-time
+
               setMessages(prev => {
                 const idx = prev.findIndex(m => m.id === assistantMsgId);
                 if (idx === -1) {
@@ -456,123 +561,61 @@ export default function Home() {
         }
       }
 
-      // Finalize message
+      if (!fullContent) {
+        throw new Error("The model returned an empty response. Please try again.");
+      }
+
       const responseTime = Date.now() - responseStartRef.current;
-      setMessages(prev => prev.map(m => 
+      setMessages(prev => prev.map(m =>
         m.id === assistantMsgId ? { ...m, responseTime } : m
       ));
     } catch (err: any) {
-      if (err.name === "AbortError" || err.name === "CanceledError") {
-        // If we have partial content, keep it
+      if (err?.name === "AbortError" || err?.name === "CanceledError") {
+        // Keep whatever streamed before the user hit Stop.
         if (streamingContentRef.current) {
           const responseTime = Date.now() - responseStartRef.current;
-          setMessages(prev => prev.map(m => 
-            m.content === streamingContentRef.current ? { ...m, responseTime } : m
+          setMessages(prev => prev.map(m =>
+            m.id === assistantMsgId ? { ...m, responseTime } : m
           ));
         }
         return;
       }
-      const errorMsg = err.message || "Error: request failed.";
+      const errorMsg = err?.message || "Error: request failed.";
       setMessages(prev => [...prev, { id: generateId(), role: "assistant", content: errorMsg, isError: true, timestamp: Date.now() }]);
     } finally {
       setLoading(false);
       setIsStreaming(false);
       abortRef.current = null;
     }
-  }, [messages]);
+  }, []);
+
+  const regenerate = useCallback(async () => {
+    if (loading) return;
+    // Drop the most recent assistant reply and re-send up to the user message
+    // that prompted it.
+    const current = messagesRef.current;
+    const lastAssistantIdx = current.findLastIndex(m => m.role === "assistant");
+    if (lastAssistantIdx === -1) return;
+
+    const before = current.slice(0, lastAssistantIdx);
+    const lastUserIdx = before.findLastIndex(m => m.role === "user");
+    if (lastUserIdx === -1) return;
+
+    const msgsToSend = before.slice(0, lastUserIdx + 1);
+    setMessages(msgsToSend);
+    await streamResponse(msgsToSend);
+  }, [loading, streamResponse]);
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    if (!text || loading || input.length > MAX_CHARS) return;
 
     const userMsg: Message = { id: generateId(), role: "user", content: text, timestamp: Date.now() };
-    const updated = [...messages, userMsg];
+    const updated = [...messagesRef.current, userMsg];
     setMessages(updated);
     setInput("");
-    setLoading(true);
-    setIsStreaming(true);
-    setAutoScroll(true);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-    streamingContentRef.current = "";
-    responseStartRef.current = Date.now();
-
-    try {
-      const res = await fetch("/api/chat/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: updated }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: "Invalid response" }));
-        throw new Error(data.error || `HTTP error ${res.status}`);
-      }
-
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      
-      if (!reader) throw new Error("No reader available");
-
-      const assistantMsgId = generateId();
-      let fullContent = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-        const lines = text.split("\n");
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6);
-          if (data === "[DONE]") continue;
-
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.content) {
-              fullContent += parsed.content;
-              streamingContentRef.current = fullContent;
-              
-              setMessages(prev => {
-                const idx = prev.findIndex(m => m.id === assistantMsgId);
-                if (idx === -1) {
-                  return [...prev, { id: assistantMsgId, role: "assistant", content: fullContent, timestamp: Date.now() }];
-                }
-                return prev.map(m => m.id === assistantMsgId ? { ...m, content: fullContent } : m);
-              });
-            }
-          } catch {
-            // Skip malformed JSON
-          }
-        }
-      }
-
-      const responseTime = Date.now() - responseStartRef.current;
-      setMessages(prev => prev.map(m => 
-        m.id === assistantMsgId ? { ...m, responseTime } : m
-      ));
-    } catch (err: any) {
-      if (err.name === "AbortError" || err.name === "CanceledError") {
-        if (streamingContentRef.current) {
-          const responseTime = Date.now() - responseStartRef.current;
-          setMessages(prev => prev.map(m => 
-            m.content === streamingContentRef.current ? { ...m, responseTime } : m
-          ));
-        }
-        return;
-      }
-      const errorMsg = err.message || "Error: request failed.";
-      setMessages(prev => [...prev, { id: generateId(), role: "assistant", content: errorMsg, isError: true, timestamp: Date.now() }]);
-    } finally {
-      setLoading(false);
-      setIsStreaming(false);
-      abortRef.current = null;
-    }
-  }, [input, loading, messages]);
+    await streamResponse(updated);
+  }, [input, loading, streamResponse]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -613,7 +656,13 @@ export default function Home() {
   );
   const charCount = input.length;
   const isOverLimit = charCount > MAX_CHARS;
-  const canRegenerate = visibleMessages.length > 0 && visibleMessages[visibleMessages.length - 1]?.role === "user";
+  const lastAssistantId = useMemo(() => {
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      if (visibleMessages[i].role === "assistant") return visibleMessages[i].id;
+    }
+    return null;
+  }, [visibleMessages]);
+  const hasMessages = visibleMessages.length > 0;
 
   return (
     <div style={styles.wrapper}>
@@ -622,13 +671,14 @@ export default function Home() {
         <span style={styles.title}>CleanChat</span>
         <div style={{ flex: 1 }} />
         {!autoScroll && visibleMessages.length > 2 && (
-          <button 
+          <button
             onClick={() => {
               setAutoScroll(true);
               chatEnd.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-            }} 
+            }}
             style={styles.scrollBtn}
             title="Scroll to bottom"
+            aria-label="Scroll to bottom"
           >
             ↓
           </button>
@@ -636,7 +686,13 @@ export default function Home() {
         <button onClick={createNewConversation} style={styles.newBtn} title="New chat (Ctrl+Shift+N)">
           + New
         </button>
-        <button onClick={() => setShowSidebar(!showSidebar)} style={styles.sidebarBtn} title="Conversations">
+        <button
+          onClick={() => setShowSidebar(!showSidebar)}
+          style={styles.sidebarBtn}
+          title="Conversations"
+          aria-label="Toggle conversations sidebar"
+          aria-expanded={showSidebar}
+        >
           ☰
         </button>
       </div>
@@ -660,20 +716,19 @@ export default function Home() {
                   isActive={currentConvId === conv.id}
                   onSelect={() => selectConversation(conv.id)}
                   onDelete={() => deleteConversation(conv.id)}
+                  onRename={(title) => renameConversation(conv.id, title)}
                 />
               ))
             )}
           </div>
-          {messages.length > 1 && (
+          {hasMessages && (
             <div style={styles.sidebarFooter}>
-              <button onClick={exportChat} style={styles.exportBtn}>
-                Export Chat
+              <button onClick={exportChatMarkdown} style={styles.exportBtn}>
+                Export .md
               </button>
-              {canRegenerate && !loading && (
-                <button onClick={regenerate} style={styles.regenBtn}>
-                  Regenerate
-                </button>
-              )}
+              <button onClick={exportChatJson} style={styles.exportBtn}>
+                Export .json
+              </button>
             </div>
           )}
         </div>
@@ -700,6 +755,9 @@ export default function Home() {
             message={m}
             onCopy={copyText}
             copiedIdx={copiedIdx}
+            isLastAssistant={m.id === lastAssistantId}
+            onRegenerate={regenerate}
+            loading={loading}
           />
         ))}
         {loading && <TypingIndicator />}
@@ -844,6 +902,29 @@ export default function Home() {
           color: #888;
           background: #0a0a0a;
           font-style: italic;
+        }
+        .bubble-content h1,
+        .bubble-content h2,
+        .bubble-content h3 {
+          margin: 12px 0 6px;
+          line-height: 1.3;
+          color: #fff;
+          font-weight: 700;
+        }
+        .bubble-content h1 { font-size: 20px; }
+        .bubble-content h2 { font-size: 17px; }
+        .bubble-content h3 { font-size: 15px; }
+        .bubble-content hr {
+          border: none;
+          border-top: 1px solid #333;
+          margin: 12px 0;
+        }
+        .bubble-content a {
+          color: #ff7777;
+          text-decoration: underline;
+        }
+        .bubble-content a:hover {
+          color: #ff9999;
         }
         li {
           margin-left: 20px;
@@ -995,6 +1076,15 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: "nowrap",
     padding: 0,
   },
+  convRename: {
+    background: "transparent",
+    border: "none",
+    color: "#666",
+    fontSize: 12,
+    cursor: "pointer",
+    padding: "2px 4px",
+    borderRadius: 4,
+  },
   convDelete: {
     background: "transparent",
     border: "none",
@@ -1025,17 +1115,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 6,
     padding: "8px 12px",
     fontSize: 12,
-    cursor: "pointer",
-  },
-  regenBtn: {
-    flex: 1,
-    background: "#ff4444",
-    color: "#fff",
-    border: "none",
-    borderRadius: 6,
-    padding: "8px 12px",
-    fontSize: 12,
-    fontWeight: 600,
     cursor: "pointer",
   },
   chat: {

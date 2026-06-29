@@ -225,12 +225,13 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    console.error("Streaming error:", err.message);
-    
-    // Fallback to non-streaming
+    console.error("Streaming error:", err?.message || err);
+
+    // Return a real error status so the client surfaces it instead of
+    // silently receiving a 200 with no stream data.
     return new NextResponse(
-      JSON.stringify({ error: `Connection failed. Please try again.`, fallback: true }),
-      { status: 200, headers: { "Content-Type": "application/json", "X-Fallback": "true" } }
+      JSON.stringify({ error: "Connection to the model failed. Please try again." }),
+      { status: 502, headers: { "Content-Type": "application/json" } }
     );
   }
 }
