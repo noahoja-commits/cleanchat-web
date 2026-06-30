@@ -170,6 +170,11 @@ const MessageBubble = memo(function MessageBubble({
     onCopy(content, id);
   }, [content, id, onCopy]);
 
+  // Cache the rendered markdown so the regex pipeline only runs when this
+  // message's text changes — not on re-renders triggered by sibling state
+  // (another bubble's copy button, the global loading flag, etc.).
+  const html = useMemo(() => formatContent(content), [content]);
+
   return (
     <div
       style={{
@@ -193,7 +198,7 @@ const MessageBubble = memo(function MessageBubble({
         <div
           className="bubble-content"
           dangerouslySetInnerHTML={{
-            __html: formatContent(content),
+            __html: html,
           }}
           onClick={(e) => {
             const target = e.target as HTMLElement;
